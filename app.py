@@ -4,24 +4,18 @@ FMCSA Carrier Census Explorer
 
 Streamlit aplikacija koja povlači FMCSA Company Census podatke
 (data.transportation.gov, dataset "az4n-8mr2") preko Socrata SODA API-ja,
-filtrira ih po državi i statusu operatera, prikazuje tabelu
+filtrira ih po državi, statusu operatera i veličini flote
+(owner-operatori sa jednim kamionom ili svi prevoznici), prikazuje tabelu
 (Company, Phone, State, Power Units) i nudi preuzimanje u CSV formatu.
 
 Pokretanje:
     pip install -r requirements.txt
     streamlit run app.py
-
-Tajne (secrets) — lokalno u .streamlit/secrets.toml,
-na Streamlit Community Cloud-u u App settings → Secrets:
-    APP_PASSWORD = "lozinka_za_klijenta"   # uključuje zaštitu lozinkom
-    SOCRATA_APP_TOKEN = "tvoj_token"       # opciono, veći limit API zahteva
 """
 
 from __future__ import annotations
 
-import hmac
 import os
-import time
 from datetime import date
 
 import pandas as pd
@@ -45,6 +39,11 @@ STATUS_OPTIONS = {
     "Inactive": "I",
     "Pending": "P",
 }
+
+# Veličina flote: owner-operator = prevoznik sa tačno jednim kamionom (power_units = 1)
+OWNER_OPERATORS = "Owner-operators (1 truck)"
+ALL_CARRIERS = "All carriers"
+FLEET_OPTIONS = [OWNER_OPERATORS, ALL_CARRIERS]
 
 US_STATES = {
     "AL": "Alabama",
@@ -107,73 +106,45 @@ US_STATES = {
 
 
 # ---------------------------------------------------------------------------
-# Tajne (secrets) i zaštita lozinkom
-# ---------------------------------------------------------------------------
-
-def get_secret(name: str) -> str | None:
-    """Čita vrednost iz env varijable ili iz Streamlit secrets; vraća None ako ne postoji."""
-    value = os.environ.get(name)
-    if value:
-        return value
-
-    try:
-        value = st.secrets.get(name)
-    except Exception:
-        # Nema secrets.toml fajla (npr. lokalno pokretanje bez tajni)
-        return None
-
-    if value is None or str(value).strip() == "":
-        return None
-    return str(value)
-
-
-def require_password() -> bool:
-    """
-    Prikazuje ekran za prijavu ako je APP_PASSWORD podešen.
-    Vraća True kada korisnik sme da vidi aplikaciju.
-    """
-    expected = get_secret("APP_PASSWORD")
-    if expected is None:
-        return True  # zaštita je isključena
-
-    if st.session_state.get("authenticated"):
-        return True
-
-    _, center, _ = st.columns([1, 2, 1])
-    with center:
-        st.title("FMCSA carrier census")
-        st.write("Enter the password to open the carrier search.")
-
-        with st.form("login"):
-            entered = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Sign in", type="primary", width="stretch")
-
-        if submitted:
-            if hmac.compare_digest(entered.encode("utf-8"), expected.encode("utf-8")):
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                time.sleep(1)  # usporava pogađanje lozinke
-                st.error("Incorrect password. Try again.")
-
-    return False
-
-
-# ---------------------------------------------------------------------------
 # Pomoćne funkcije
 # ---------------------------------------------------------------------------
 
+def get_app_token() -> str | None:
+    """
+    Opcioni Socrata app token (veći limit API zahteva).
+    Aplikacija radi i bez njega.
+    """
+    token = os.environ.get("SOCRATA_APP_TOKEN")
+    if token:
+        return token
+
+    try:
+        token = st.secrets.get("SOCRATA_APP_TOKEN")
+    except Exception:
+        # Nema secrets.toml fajla, što je sasvim u redu
+        return None
+
+    if token is None or str(token).strip() == "":
+        return None
+    return str(token)
+
+
 def build_headers() -> dict[str, str]:
     headers = {"Accept": "application/json"}
-    token = get_secret("SOCRATA_APP_TOKEN")
+    token = get_app_token()
     if token:
         headers["X-App-Token"] = token
     return headers
 
 
-def build_where(state_codes: list[str], status_codes: list[str]) -> str:
+def build_where(
+    state_codes: list[str], status_codes: list[str], owner_operators_only: bool
+) -> str:
     """Pravi SoQL $where uslov. Vrednosti dolaze iz fiksnih lista, ne od korisnika."""
     clauses = ["phy_country = 'US'"]
+    if owner_operators_only:
+        # power_units je tekstualno polje u datasetu, zato poredimo sa '1'
+        clauses.append("power_units = '1'")
     if state_codes:
         states_sql = ", ".join(f"'{code}'" for code in state_codes)
         clauses.append(f"phy_state in ({states_sql})")
@@ -219,7 +190,11 @@ def to_display_frame(records: list[dict]) -> pd.DataFrame:
     return table
 
 
-def build_file_name(state_codes: list[str], status_labels: list[str]) -> str:
+def build_file_name(
+    state_codes: list[str], status_labels: list[str], owner_operators_only: bool
+) -> str:
+    fleet_part = "owner-operators" if owner_operators_only else "carriers"
+
     if not state_codes:
         states_part = "all-states"
     elif len(state_codes) <= 5:
@@ -228,7 +203,7 @@ def build_file_name(state_codes: list[str], status_labels: list[str]) -> str:
         states_part = f"{len(state_codes)}-states"
 
     status_part = "-".join(label.lower() for label in status_labels) or "all-statuses"
-    return f"fmcsa_carriers_{states_part}_{status_part}_{date.today():%Y%m%d}.csv"
+    return f"fmcsa_{fleet_part}_{states_part}_{status_part}_{date.today():%Y%m%d}.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +282,6 @@ st.set_page_config(
     layout="wide",
 )
 
-password_enabled = get_secret("APP_PASSWORD") is not None
-
-if not require_password():
-    st.stop()
-
 with st.sidebar:
     st.header("Filters")
 
@@ -322,6 +292,13 @@ with st.sidebar:
             format_func=lambda code: f"{code} – {US_STATES[code]}",
             placeholder="All states",
             help="Physical address state. Leave empty to include every US state.",
+        )
+
+        fleet_choice = st.radio(
+            "Carrier type",
+            options=FLEET_OPTIONS,
+            index=0,
+            help="Owner-operators run a single truck, usually one person driving under their own name or a small LLC.",
         )
 
         selected_status_labels = st.multiselect(
@@ -348,20 +325,17 @@ with st.sidebar:
         "Results are cached for one hour."
     )
 
-    if password_enabled:
-        if st.button("Sign out", width="stretch"):
-            st.session_state.pop("authenticated", None)
-            st.rerun()
-    else:
-        st.warning(
-            "Password protection is off. Add APP_PASSWORD to the app secrets to turn it on."
-        )
+owner_operators_only = fleet_choice == OWNER_OPERATORS
 
-st.title("FMCSA carrier census")
-st.write("US motor carriers registered with FMCSA, filtered by state and operator status.")
+if owner_operators_only:
+    st.title("FMCSA owner-operators")
+    st.write("One-truck carriers registered with FMCSA, filtered by state and operator status.")
+else:
+    st.title("FMCSA carrier census")
+    st.write("US motor carriers registered with FMCSA, filtered by state and operator status.")
 
 status_codes = [STATUS_OPTIONS[label] for label in selected_status_labels]
-where_clause = build_where(selected_states, status_codes)
+where_clause = build_where(selected_states, status_codes, owner_operators_only)
 
 try:
     with st.spinner("Loading carriers from FMCSA…"):
@@ -376,12 +350,12 @@ if carriers.empty:
     st.stop()
 
 loaded_rows = len(carriers)
-total_power_units = int(carriers["Power Units"].sum(skipna=True))
+states_in_results = carriers["State"].replace("", pd.NA).nunique()
 
-col_total, col_loaded, col_units = st.columns(3)
+col_total, col_loaded, col_states = st.columns(3)
 col_total.metric("Matching carriers", f"{total_matching:,}")
 col_loaded.metric("Loaded in table", f"{loaded_rows:,}")
-col_units.metric("Power units (loaded)", f"{total_power_units:,}")
+col_states.metric("States in results", f"{states_in_results:,}")
 
 if total_matching > loaded_rows:
     st.info(
@@ -393,7 +367,7 @@ csv_bytes = carriers.to_csv(index=False).encode("utf-8-sig")  # BOM da Excel pra
 st.download_button(
     label="Download CSV",
     data=csv_bytes,
-    file_name=build_file_name(selected_states, selected_status_labels),
+    file_name=build_file_name(selected_states, selected_status_labels, owner_operators_only),
     mime="text/csv",
     type="primary",
     icon=":material/download:",
